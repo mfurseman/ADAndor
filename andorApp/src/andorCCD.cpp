@@ -884,22 +884,26 @@ asynStatus AndorCCD::writeFloat64(asynUser *pasynUser, epicsFloat64 value)
 }
 
 /* Called if tracks acquisition mode is being used.
-   Sets up the track defintion. */
+   Sets up the track definition. */
 void AndorCCD::setupTrackDefn(int minX, int sizeX, int binX)
 {
     static const char *functionName = "setupTrackDefn";
     if (mMultiTrack.size() == 0)
     {
         asynPrint(this->pasynUserSelf, ASYN_TRACE_WARNING,
-            "%s:%s: A track defintion must be set to use tracks mode\n",
+            "%s:%s: A track definition must be set to use tracks mode\n",
             driverName, functionName);
         return;
     }
 
+    // Get track definitions, coerced into valid values
+    std::vector<NDDimension_t> tracks = mMultiTrack.validTracks();
+    setIntegerParam(NDArraySizeY, mMultiTrack.totalDataHeight());
+
+    // Convert to array required by andor library (1-based)
     static const int ValuesPerTrack = 6;
-    std::vector<int> TrackDefn(mMultiTrack.size() * 6);
-    setIntegerParam(NDArraySizeY, mMultiTrack.DataHeight());
-    for (size_t TrackNo = 0; TrackNo < mMultiTrack.size(); TrackNo++)
+    std::vector<int> TrackDefn(tracks.size() * ValuesPerTrack);
+    for (size_t t = 0; t < tracks.size(); t++)
     {
         /*
         Each track must be defined by a group of six integers.
@@ -907,26 +911,26 @@ void AndorCCD::setupTrackDefn(int minX, int sizeX, int binX)
             - The left and right positions for the area of interest within each track
             - The horizontal and vertical binning for each track. */
         /*
-        Andor use 1-based exclusive co-ordinates.
+        Andor use 1-based inclusive co-ordinates.
         e.g. from SDK manual:
         1 2 1 1024 1 1
         3 4 1 1024 1 1
         5 6 1 1024 1 1
         7 8 1 1024 1 1
         9 10 1 1024 1 1 */
-        TrackDefn[TrackNo * 6 + 0] = mMultiTrack.TrackStart(TrackNo) + 1;
-        TrackDefn[TrackNo * 6 + 1] = mMultiTrack.TrackEnd(TrackNo) + 2; // CCDMultiTrack uses 0-based inlcusive co-ordinates.
-        TrackDefn[TrackNo * 6 + 2] = minX + 1;
-        TrackDefn[TrackNo * 6 + 3] = minX + sizeX;
-        TrackDefn[TrackNo * 6 + 4] = binX;
-        TrackDefn[TrackNo * 6 + 5] = mMultiTrack.TrackBin(TrackNo);
+        TrackDefn[t * 6 + 0] = tracks[t].offset + 1;
+        TrackDefn[t * 6 + 1] = tracks[t].offset + tracks[t].size;
+        TrackDefn[t * 6 + 2] = minX + 1;
+        TrackDefn[t * 6 + 3] = minX + sizeX;
+        TrackDefn[t * 6 + 4] = binX;
+        TrackDefn[t * 6 + 5] = tracks[t].binning;
     }
     checkStatus(SetCustomTrackHBin(binX));
     checkStatus(SetComplexImage(int(TrackDefn.size() / ValuesPerTrack), &TrackDefn[0]));
 }
 
 /* Called to set tracks definition parameters.
-   Sets up the track defintion. */
+   Sets up the track definition. */
 asynStatus AndorCCD::writeInt32Array(asynUser *pasynUser, epicsInt32 *value, size_t nElements)
 {
     static const char *functionName = "writeInt32Array";
@@ -936,6 +940,7 @@ asynStatus AndorCCD::writeInt32Array(asynUser *pasynUser, epicsInt32 *value, siz
         if (status != asynError)
             setupAcquisition();
         else
+            // Parameter not handled by CCDMultiTrack - pass to superclass
             status = ADDriver::writeInt32Array(pasynUser, value, nElements);
     }
     catch (const std::string &e) {
@@ -1249,16 +1254,71 @@ asynStatus AndorCCD::setupAcquisition()
     numImages = 1;
     setIntegerParam(ADNumImages, numImages);
   }
+
+  // Validate and adjust X axis
+  getIntegerParam(ADMaxSizeX, &maxSizeX);
+  getIntegerParam(ADMinX, &minX);
+  getIntegerParam(ADSizeX, &sizeX);
   getIntegerParam(ADBinX, &binX);
-  if (binX <= 0) {
+  getIntegerParam(ADReverseX, &reverseX);
+  if (binX < 1) {
     binX = 1;
-    setIntegerParam(ADBinX, binX);
+  } else if (binX > maxSizeX) {
+    binX = maxSizeX;
   }
+  if (minX < 0) {
+    minX = 0;
+  } else if (minX > maxSizeX - binX) {
+    minX = maxSizeX - binX;
+  }
+  if (sizeX < binX) {
+    sizeX = binX;
+  } else if (sizeX > maxSizeX - minX) {
+    sizeX = maxSizeX - minX;
+  }
+  if (sizeX % binX != 0) {
+    sizeX = (sizeX / binX) * binX;
+  }
+  setIntegerParam(ADMinX, minX);
+  setIntegerParam(ADSizeX, sizeX);
+  setIntegerParam(ADBinX, binX);
+
+  // Validate and adjust Y axis
+  getIntegerParam(ADMinY, &minY);
+  getIntegerParam(ADSizeY, &sizeY);
   getIntegerParam(ADBinY, &binY);
-  if (binY <= 0) {
+  getIntegerParam(ADReverseY, &reverseY);
+  getIntegerParam(ADMaxSizeY, &maxSizeY);
+  if (readOutMode == ARFullVerticalBinning) {
+    // Set maximum binning but do not update parameter, this preserves ADBinY
+    // when going back to Image readout mode.
+    binY = maxSizeY;
+  } else if (binY <= 0) {
     binY = 1;
     setIntegerParam(ADBinY, binY);
+  } else if (binY > maxSizeY) {
+    binY = maxSizeY;
+    setIntegerParam(ADBinY, binY);
   }
+  if (minY < 0) {
+    minY = 0;
+    setIntegerParam(ADMinY, minY);
+  } else if (minY > maxSizeY - binY) {
+    minY = maxSizeY - binY;
+    setIntegerParam(ADMinY, minY);
+  }
+  if (sizeY < binY) {
+    sizeY = binY;
+    setIntegerParam(ADSizeY, sizeY);
+  } else if (sizeY > maxSizeY - minY) {
+    sizeY = maxSizeY - minY;
+    setIntegerParam(ADSizeY, sizeY);
+  }
+  if (sizeY % binY != 0) {
+    sizeY = (sizeY / binY) * binY;
+    setIntegerParam(ADSizeY, sizeY);
+  }
+
   // Check EM gain capability and range, and set gain mode before setting gain and limits
   if ((int)mCapabilities.ulEMGainCapability > 0) {
     getIntegerParam(AndorEmGainAdvanced, &emGainAdvanced);
@@ -1275,35 +1335,6 @@ asynStatus AndorCCD::setupAcquisition()
       emGain = mEmGainRangeHigh;
       setIntegerParam(AndorEmGain, emGain);
     }
-  }
-  getIntegerParam(ADMinX, &minX);
-  getIntegerParam(ADMinY, &minY);
-  getIntegerParam(ADSizeX, &sizeX);
-  getIntegerParam(ADSizeY, &sizeY);
-  getIntegerParam(ADReverseX, &reverseX);
-  getIntegerParam(ADReverseY, &reverseY);
-  getIntegerParam(ADMaxSizeX, &maxSizeX);
-  getIntegerParam(ADMaxSizeY, &maxSizeY);
-  if (readOutMode == ARFullVerticalBinning) {
-    // Set maximum binning but do not update parameter, this preserves ADBinY
-    // when going back to Image readout mode.
-    binY = maxSizeY;
-  }
-  if (minX > (maxSizeX - binX)) {
-    minX = maxSizeX - binX;
-    setIntegerParam(ADMinX, minX);
-  }
-  if (minY > (maxSizeY - binY)) {
-    minY = maxSizeY - binY;
-    setIntegerParam(ADMinY, minY);
-  }
-  if ((minX + sizeX) > maxSizeX) {
-    sizeX = maxSizeX - minX;
-    setIntegerParam(ADSizeX, sizeX);
-  }
-  if ((minY + sizeY) > maxSizeY) {
-    sizeY = maxSizeY - minY;
-    setIntegerParam(ADSizeY, sizeY);
   }
   
   // Note: we do triggerMode and adcChannel in this function because they change
